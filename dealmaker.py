@@ -6,7 +6,7 @@ import pandas as pd
 def simulate_contract(
     list_price: float,
     discount: float,
-    monthly_oled_delivery: int,
+    monthly_oled_delivery_plan,
     initial_component_inventory: int,
     monthly_production_plan,
     payment_terms_days: int,
@@ -27,7 +27,11 @@ def simulate_contract(
     initial_final_inventory: int = 500,
     neginfo_cost: float = 0.0,
 ):
-    """Simulate 12-month OLED supply, production and P&L under a given deal."""
+    """Simulate 12-month OLED supply, production and P&L under a given deal.
+
+    monthly_oled_delivery_plan and monthly_production_plan are lists of 12
+    integers (one per month).
+    """
 
     final_price_component = list_price * (1 - discount / 100.0)
 
@@ -54,7 +58,7 @@ def simulate_contract(
         # --- COMPONENT SIDE (OLEDs) ---
         comp_start_inv = comp_inv
 
-        received_from_cda = monthly_oled_delivery
+        received_from_cda = monthly_oled_delivery_plan[month - 1]
         total_oleds_purchased += received_from_cda
 
         doa_units = int(received_from_cda * doa_rate)
@@ -203,7 +207,7 @@ st.markdown(
     "game rules: price, volume, quality, logistics and P&L over 12 months."
 )
 
-# Global / environment parameters (typically fixed by the game)
+# Global / environment parameters (same for both scenarios)
 st.sidebar.header("Global parameters (same for both scenarios)")
 doa_rate_global = st.sidebar.number_input("DOA rate at reception (%)", value=1.75, step=0.05) / 100.0
 field_failure_rate_global = st.sidebar.number_input(
@@ -234,9 +238,14 @@ neginfo_cost_global = st.sidebar.number_input(
     "NEGINFO total cost (€/year)", value=0.0, step=1000.0
 )
 
-# Default production plan helper
-def default_plan():
+# Default plan helpers
+def default_prod_plan():
     return [6000] + [5900] * 11
+
+
+def default_supply_plan():
+    return [6000] * 12
+
 
 # Scenario tabs
 tabA, tabB, tabCompare = st.tabs(["Scenario A", "Scenario B", "Comparison"])
@@ -247,9 +256,6 @@ with tabA:
     with col1:
         list_price_A = st.number_input("List price A (€/unit)", value=178.0, step=1.0, key="lp_A")
         discount_A = st.number_input("Discount A (%)", value=0.0, step=0.1, key="disc_A")
-        monthly_oled_delivery_A = st.number_input(
-            "Monthly OLED delivery A (units)", value=6000, step=100, key="deliv_A"
-        )
         payment_terms_days_A = st.number_input("Payment terms A (days)", value=60, step=5, key="pt_A")
     with col2:
         initial_component_inventory_A = st.number_input(
@@ -264,15 +270,29 @@ with tabA:
             key="doa_rep_A",
         )
 
-    st.markdown("**Monthly production plan A (final units)**")
-    monthly_production_plan_A = []
+    st.markdown("**Monthly OLED supply plan A (from CDA)**")
+    monthly_supply_plan_A = []
     cols = st.columns(4)
     for i in range(12):
         with cols[i % 4]:
+            monthly_supply_plan_A.append(
+                st.number_input(
+                    f"Sup A M{i + 1}",
+                    value=default_supply_plan()[i],
+                    step=50,
+                    key=f"sup_A_{i}",
+                )
+            )
+
+    st.markdown("**Monthly production plan A (final units)**")
+    monthly_production_plan_A = []
+    cols_prod_A = st.columns(4)
+    for i in range(12):
+        with cols_prod_A[i % 4]:
             monthly_production_plan_A.append(
                 st.number_input(
-                    f"M{i + 1}",
-                    value=default_plan()[i],
+                    f"Prod A M{i + 1}",
+                    value=default_prod_plan()[i],
                     step=50,
                     key=f"prod_A_{i}",
                 )
@@ -294,9 +314,6 @@ with tabB:
     with col1:
         list_price_B = st.number_input("List price B (€/unit)", value=178.0, step=1.0, key="lp_B")
         discount_B = st.number_input("Discount B (%)", value=0.0, step=0.1, key="disc_B")
-        monthly_oled_delivery_B = st.number_input(
-            "Monthly OLED delivery B (units)", value=6000, step=100, key="deliv_B"
-        )
         payment_terms_days_B = st.number_input("Payment terms B (days)", value=60, step=5, key="pt_B")
     with col2:
         initial_component_inventory_B = st.number_input(
@@ -311,15 +328,29 @@ with tabB:
             key="doa_rep_B",
         )
 
-    st.markdown("**Monthly production plan B (final units)**")
-    monthly_production_plan_B = []
+    st.markdown("**Monthly OLED supply plan B (from CDA)**")
+    monthly_supply_plan_B = []
     cols = st.columns(4)
     for i in range(12):
         with cols[i % 4]:
+            monthly_supply_plan_B.append(
+                st.number_input(
+                    f"Sup B M{i + 1}",
+                    value=default_supply_plan()[i],
+                    step=50,
+                    key=f"sup_B_{i}",
+                )
+            )
+
+    st.markdown("**Monthly production plan B (final units)**")
+    monthly_production_plan_B = []
+    cols_prod_B = st.columns(4)
+    for i in range(12):
+        with cols_prod_B[i % 4]:
             monthly_production_plan_B.append(
                 st.number_input(
-                    f"M{i + 1}",
-                    value=default_plan()[i],
+                    f"Prod B M{i + 1}",
+                    value=default_prod_plan()[i],
                     step=50,
                     key=f"prod_B_{i}",
                 )
@@ -341,7 +372,7 @@ if run:
     df_A, kpis_A = simulate_contract(
         list_price=list_price_A,
         discount=discount_A,
-        monthly_oled_delivery=monthly_oled_delivery_A,
+        monthly_oled_delivery_plan=monthly_supply_plan_A,
         initial_component_inventory=initial_component_inventory_A,
         monthly_production_plan=monthly_production_plan_A,
         payment_terms_days=payment_terms_days_A,
@@ -365,7 +396,7 @@ if run:
     df_B, kpis_B = simulate_contract(
         list_price=list_price_B,
         discount=discount_B,
-        monthly_oled_delivery=monthly_oled_delivery_B,
+        monthly_oled_delivery_plan=monthly_supply_plan_B,
         initial_component_inventory=initial_component_inventory_B,
         monthly_production_plan=monthly_production_plan_B,
         payment_terms_days=payment_terms_days_B,
@@ -460,7 +491,7 @@ st.markdown(
 ---
 ### How to use this app
 1. Set the *global game parameters* in the sidebar (DOA rate, demand, production cost, etc.).  \
-2. In **Scenario A** and **Scenario B** tabs, enter the negotiated contract terms and production plans.  \
+2. In **Scenario A** and **Scenario B** tabs, enter contract terms, **monthly OLED supply plans** and production plans.  \
 3. Click **Run simulation for both scenarios**.  \
 4. Review each scenario in its tab, then open **Comparison** to see KPI and profit deltas.  \
 5. Save this script as `negotiation_sim_app.py`, push it to GitHub, and run with:
