@@ -1,503 +1,311 @@
+# ipb_simulator.py
 import streamlit as st
 import pandas as pd
+import numpy as np
 
-# --- Core simulation logic ---
+st.set_page_config(page_title="IPB Negotiation Simulator", layout="wide")
 
-def simulate_contract(
-    list_price: float,
-    discount: float,
-    monthly_oled_delivery_plan,
-    initial_component_inventory: int,
-    monthly_production_plan,
-    payment_terms_days: int,
-    doa_rate: float = 0.0175,
-    doa_replacement_mode: str = "Next month",
-    customization: bool = True,
-    technical_support_weeks: float = 3.0,
-    ecolowrap: bool = True,
-    cost_of_capital: float = 0.10,
-    # extra economics to mirror the class simulator
-    transport_cost_per_unit_from_cda: float = 13.1,
-    transport_cost_per_unit_to_cda: float = 0.0,
-    insurance_cost_per_unit: float = 2.67,
-    field_failure_rate: float = 0.0185,
-    final_product_price: float = 678.0,
-    monthly_demand_units: int = 6029,
-    prod_cost_per_unit_excl_oled: float = 257.4,
-    initial_final_inventory: int = 500,
-    neginfo_cost: float = 0.0,
+# ---------- CONSTANTS (you can adjust) ----------
+DEFAULT_SELLING_PRICE = 672.73      # €/unit (IPB average selling price in Yr0)
+OTHER_VAR_COST_PER_UNIT = 257.4     # €/unit (all components except OLED)
+FIXED_COST_YEAR = 14_800_000        # €/year
+DEFECT_RATE_FIELD = 0.02            # 2% of final products have a defect
+WARRANTY_COST_PER_UNIT = 125        # €/defective unit
+COST_OF_CAPITAL = 0.10              # 10% cost of capital
+INITIAL_OLED_INVENTORY = 500        # units on Jan 1
+INITIAL_FINAL_INV = 500             # units on Jan 1
+ECOLORAP_GRANT = 200_000            # one-off grant if Ecolowrap is used
+VALUE_PER_ENGINEER_WEEK = 10_000    # € benefit per engineer-week of support
+CUSTOMIZATION_VALUE_PER_UNIT = 5    # € extra margin per unit if customization
+
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+# ---------- HELPER FUNCTIONS ----------
+
+def simulate_scenario(
+    name: str,
+    monthly_volume: np.ndarray,
+    gross_price: float,
+    discount_pct: float,
+    terms_of_payment_days: int,
+    use_ecolowrap: bool,
+    tech_support_weeks: float,
+    customization: bool,
+    incoterm: str,
+    doa_replacement: str,
+    expected_monthly_demand: float,
+    selling_price: float,
 ):
-    """Simulate 12-month OLED supply, production and P&L under a given deal.
+    """Return a dict with all KPI for a given scenario (IPB perspective)."""
 
-    monthly_oled_delivery_plan and monthly_production_plan are lists of 12
-    integers (one per month).
-    """
+    # Sanity
+    monthly_volume = np.array(monthly_volume, dtype=float)
+    total_purchases_units = monthly_volume.sum()
 
-    final_price_component = list_price * (1 - discount / 100.0)
+    # Units demanded and available
+    total_demand_units = expected_monthly_demand * 12
+    max_available_oleds = INITIAL_OLED_INVENTORY + total_purchases_units
+    units_sold = min(total_demand_units, max_available_oleds)
 
-    records = []
-    comp_inv = initial_component_inventory
-    final_inv = initial_final_inventory
-    prev_month_doa = 0
+    # Prices
+    net_unit_price = gross_price * (1 - discount_pct / 100.0)
 
-    total_oleds_purchased = 0
-    total_units_produced = 0
-    total_units_sold = 0
+    # Revenue & basic costs
+    revenue = units_sold * selling_price
+    oled_cost = total_purchases_units * net_unit_price
+    other_var_cost = units_sold * OTHER_VAR_COST_PER_UNIT
+    fixed_cost = FIXED_COST_YEAR
 
-    inventory_comp_snapshots = []
-    inventory_final_snapshots = []
+    # Warranty cost (independent of contract terms here)
+    warranty_units = units_sold * DEFECT_RATE_FIELD
+    warranty_cost = warranty_units * WARRANTY_COST_PER_UNIT
 
-    total_transport_from_cda_cost = 0.0
-    total_transport_to_cda_cost = 0.0
-    total_insurance_cost = 0.0
+    # Inventory simulation for OLEDs (derived from monthly schedule vs demand)
+    inventory = INITIAL_OLED_INVENTORY
+    inventory_levels = []
+    for m in range(12):
+        purchase = monthly_volume[m]
+        demand = expected_monthly_demand
+        inventory = inventory + purchase - demand
+        # no negative inventory; backlog ignored for cost of capital
+        inventory = max(inventory, 0)
+        inventory_levels.append(inventory)
 
-    total_sales_revenue = 0.0
-    total_prod_cost_excl_oled = 0.0
+    avg_inventory_units = (INITIAL_OLED_INVENTORY + sum(inventory_levels)) / 13.0
+    avg_inventory_value = avg_inventory_units * net_unit_price
+    inventory_cost = avg_inventory_value * COST_OF_CAPITAL
 
-    for month in range(1, 13):
-        # --- COMPONENT SIDE (OLEDs) ---
-        comp_start_inv = comp_inv
+    # Financing benefit from supplier credit (accounts payable)
+    annual_oled_purchase_value = oled_cost
+    avg_accounts_payable = annual_oled_purchase_value * (terms_of_payment_days / 360.0)
+    financing_benefit = avg_accounts_payable * COST_OF_CAPITAL
 
-        received_from_cda = monthly_oled_delivery_plan[month - 1]
-        total_oleds_purchased += received_from_cda
+    # Benefits from technical support, customization, ecolowrap
+    tech_support_benefit = tech_support_weeks * VALUE_PER_ENGINEER_WEEK
+    customization_benefit = (units_sold * CUSTOMIZATION_VALUE_PER_UNIT) if customization else 0.0
+    ecolowrap_benefit = ECOLORAP_GRANT if use_ecolowrap else 0.0
 
-        doa_units = int(received_from_cda * doa_rate)
-
-        # replacements arrive this month for last month's DOA
-        if doa_replacement_mode in {"Next month", "Next delivery"}:
-            replacements_arrive = prev_month_doa
-        else:
-            replacements_arrive = 0
-
-        usable_now = received_from_cda - doa_units + replacements_arrive
-        prev_month_doa = doa_units
-
-        # --- FINAL PRODUCT PRODUCTION ---
-        production = monthly_production_plan[month - 1]
-        total_units_produced += production
-
-        comp_end_inv = comp_start_inv + usable_now - production
-        comp_inv = comp_end_inv
-
-        # --- FINAL PRODUCT SIDE ---
-        final_start_inv = final_inv
-        available_for_sale = final_start_inv + production
-        demand = monthly_demand_units
-        sales_units = min(available_for_sale, demand)
-        total_units_sold += sales_units
-
-        final_end_inv = available_for_sale - sales_units
-        final_inv = final_end_inv
-
-        # --- QUALITY PROBLEMS (field failures at end consumer) ---
-        field_failures = int(sales_units * field_failure_rate)
-
-        # --- TRANSPORT & INSURANCE ---
-        volume_from_cda_due_doa = replacements_arrive
-        total_volume_from_cda = received_from_cda + volume_from_cda_due_doa
-        transport_from_cda_cost = total_volume_from_cda * transport_cost_per_unit_from_cda
-        total_transport_from_cda_cost += transport_from_cda_cost
-
-        volume_to_cda = field_failures
-        transport_to_cda_cost = volume_to_cda * transport_cost_per_unit_to_cda
-        total_transport_to_cda_cost += transport_to_cda_cost
-
-        total_volume_for_insurance = total_volume_from_cda + volume_to_cda
-        insurance_cost = total_volume_for_insurance * insurance_cost_per_unit
-        total_insurance_cost += insurance_cost
-
-        # --- ECONOMICS ---
-        sales_revenue = sales_units * final_product_price
-        total_sales_revenue += sales_revenue
-
-        prod_cost_excl_oled = production * prod_cost_per_unit_excl_oled
-        total_prod_cost_excl_oled += prod_cost_excl_oled
-
-        inventory_comp_snapshots.append(comp_start_inv)
-        inventory_final_snapshots.append(final_start_inv)
-
-        records.append(
-            {
-                "Month": month,
-                # price / volume
-                "OLEDs bought from CDA": received_from_cda,
-                # quality
-                "Field failures at end consumer": field_failures,
-                "DOA units": doa_units,
-                "DOA replacements received": replacements_arrive,
-                # inventory
-                "Component inventory start": comp_start_inv,
-                "Component inventory end": comp_end_inv,
-                "Final product inventory start": final_start_inv,
-                "Final product inventory end": final_end_inv,
-                # transport & insurance
-                "Volume from CDA due DOA": volume_from_cda_due_doa,
-                "Total volume from CDA": total_volume_from_cda,
-                "Transport cost from CDA (€)": transport_from_cda_cost,
-                "Volume to CDA (returns)": volume_to_cda,
-                "Transport cost to CDA (€)": transport_to_cda_cost,
-                "Insurance cost (€)": insurance_cost,
-                # final product
-                "Demand (units)": demand,
-                "Sales (units)": sales_units,
-                "Sales revenue (€)": sales_revenue,
-                "Production (units)": production,
-            }
-        )
-
-    inventory_comp_snapshots.append(comp_inv)
-    inventory_final_snapshots.append(final_inv)
-
-    avg_comp_inv = sum(inventory_comp_snapshots) / len(inventory_comp_snapshots)
-    avg_final_inv = sum(inventory_final_snapshots) / len(inventory_final_snapshots)
-
-    component_purchase_cost = total_oleds_purchased * final_price_component
-    inventory_comp_capital_cost = avg_comp_inv * final_price_component * cost_of_capital
-    inventory_final_capital_cost = avg_final_inv * prod_cost_per_unit_excl_oled * cost_of_capital
-
-    ecolowrap_subsidy = 200_000 if ecolowrap else 0
-
-    total_inventory_cost = inventory_comp_capital_cost + inventory_final_capital_cost
-
-    total_costs = (
-        component_purchase_cost
-        + total_prod_cost_excl_oled
-        + total_transport_from_cda_cost
-        + total_transport_to_cda_cost
-        + total_insurance_cost
-        + total_inventory_cost
-        + neginfo_cost
-        - ecolowrap_subsidy
+    # Profit
+    profit = (
+        revenue
+        - oled_cost
+        - other_var_cost
+        - fixed_cost
+        - warranty_cost
+        - inventory_cost
+        + financing_benefit
+        + tech_support_benefit
+        + customization_benefit
+        + ecolowrap_benefit
     )
 
-    negotiation_profit = total_sales_revenue - total_costs
+    margin_per_unit = profit / units_sold if units_sold > 0 else 0
 
-    kpis = {
-        "Component final price (€/unit)": round(final_price_component, 2),
-        "Total OLEDs purchased": int(total_oleds_purchased),
-        "Total units produced": int(total_units_produced),
-        "Total units sold": int(total_units_sold),
-        "Average component inventory (units)": round(avg_comp_inv, 1),
-        "Average final inventory (units)": round(avg_final_inv, 1),
-        "Component purchase cost (€/year)": round(component_purchase_cost, 0),
-        "Production cost excl. OLEDs (€/year)": round(total_prod_cost_excl_oled, 0),
-        "Transport from CDA (€/year)": round(total_transport_from_cda_cost, 0),
-        "Transport to CDA (€/year)": round(total_transport_to_cda_cost, 0),
-        "Insurance cost (€/year)": round(total_insurance_cost, 0),
-        "Inventory capital cost (€/year)": round(total_inventory_cost, 0),
-        "Ecolowrap subsidy (€/year)": ecolowrap_subsidy,
-        "NEGINFO cost (€/year)": neginfo_cost,
-        "Total sales revenue (€/year)": round(total_sales_revenue, 0),
-        "Profit from negotiation (€/year)": round(negotiation_profit, 0),
-        "Payment terms (days)": payment_terms_days,
-        "Customization included": customization,
-        "Technical support (weeks)": technical_support_weeks,
-        "Ecolowrap": ecolowrap,
+    return {
+        "Scenario": name,
+        "Units sold (estimated)": units_sold,
+        "Total OLED purchases (units)": total_purchases_units,
+        "Net OLED price (€/unit)": net_unit_price,
+        "Revenue (M€)": revenue / 1e6,
+        "OLED cost (M€)": oled_cost / 1e6,
+        "Other variable cost (M€)": other_var_cost / 1e6,
+        "Fixed cost (M€)": fixed_cost / 1e6,
+        "Warranty cost (M€)": warranty_cost / 1e6,
+        "Inventory cost (M€)": inventory_cost / 1e6,
+        "Financing benefit (M€)": financing_benefit / 1e6,
+        "Tech support benefit (M€)": tech_support_benefit / 1e6,
+        "Customization benefit (M€)": customization_benefit / 1e6,
+        "Ecolowrap benefit (M€)": ecolowrap_benefit / 1e6,
+        "Profit (M€)": profit / 1e6,
+        "Margin per unit (€/unit)": margin_per_unit,
+        "Terms of payment (days)": terms_of_payment_days,
+        "Incoterm": incoterm,
+        "DOA replacement": doa_replacement,
+        "Uses Ecolowrap": use_ecolowrap,
+        "Customization": customization,
+        "Tech support (weeks)": tech_support_weeks,
     }
 
-    df = pd.DataFrame(records)
-    return df, kpis
+# ---------- SIDEBAR: GLOBAL SETTINGS ----------
+st.sidebar.header("Global assumptions (IPB)")
 
-
-# --- Streamlit UI with two-scenario comparison ---
-
-st.title("Negotiation Deal Simulator – Scenario Comparison")
-st.markdown(
-    "Compare two negotiation outcomes (Scenario A vs Scenario B) under the same "
-    "game rules: price, volume, quality, logistics and P&L over 12 months."
+selling_price = st.sidebar.number_input(
+    "Selling price of final product (€/unit)",
+    value=DEFAULT_SELLING_PRICE,
+    step=10.0,
 )
 
-# Global / environment parameters (same for both scenarios)
-st.sidebar.header("Global parameters (same for both scenarios)")
-doa_rate_global = st.sidebar.number_input("DOA rate at reception (%)", value=1.75, step=0.05) / 100.0
-field_failure_rate_global = st.sidebar.number_input(
-    "Field failure rate at consumer (%)", value=1.85, step=0.05
+expected_monthly_demand = st.sidebar.number_input(
+    "Expected monthly demand (units)",
+    value=5800.0,
+    min_value=0.0,
+    step=100.0,
+    help="Used to calculate inventory and units sold.",
+)
+
+st.sidebar.markdown("---")
+st.sidebar.write("Cost & value parameters")
+COST_OF_CAPITAL = st.sidebar.number_input(
+    "Cost of capital (%)", value=10.0, step=0.5
 ) / 100.0
-transport_cost_per_unit_from_cda_global = st.sidebar.number_input(
-    "Transport cost from CDA (€/unit)", value=13.1, step=0.1
-)
-transport_cost_per_unit_to_cda_global = st.sidebar.number_input(
-    "Transport cost to CDA (€/unit)", value=0.0, step=0.1
-)
-insurance_cost_per_unit_global = st.sidebar.number_input(
-    "Insurance cost (€/unit)", value=2.67, step=0.01
-)
-final_product_price_global = st.sidebar.number_input(
-    "Final product selling price (€/unit)", value=678.0, step=1.0
-)
-monthly_demand_units_global = st.sidebar.number_input(
-    "Monthly demand (units)", value=6029, step=50
-)
-prod_cost_per_unit_excl_oled_global = st.sidebar.number_input(
-    "Production cost per unit excl. OLED (€/unit)", value=257.4, step=1.0
-)
-cost_of_capital_global = st.sidebar.number_input(
-    "Cost of capital (yearly, %)", value=10.0, step=0.5, min_value=0.0, max_value=100.0
-) / 100.0
-neginfo_cost_global = st.sidebar.number_input(
-    "NEGINFO total cost (€/year)", value=0.0, step=1000.0
+
+VALUE_PER_ENGINEER_WEEK = st.sidebar.number_input(
+    "Value per engineer-week (k€)", value=10.0, step=1.0
+) * 1000.0
+
+CUSTOMIZATION_VALUE_PER_UNIT = st.sidebar.number_input(
+    "Customization value per unit (€/unit)",
+    value=5.0,
+    step=1.0,
 )
 
-# Default plan helpers
-def default_prod_plan():
-    return [6000] + [5900] * 11
+ECOLORAP_GRANT = st.sidebar.number_input(
+    "Ecolowrap grant (k€)", value=200.0, step=10.0
+) * 1000.0
 
 
-def default_supply_plan():
-    return [6000] * 12
+# ---------- MAIN LAYOUT ----------
+st.title("IPB – OLED Agreement Simulator (2 Scenarios)")
+st.write(
+    "Use this app to compare two alternative agreements with CDA from IPB’s perspective. "
+    "All values are annual, based on a monthly volume schedule."
+)
 
+colA, colB = st.columns(2)
 
-# Scenario tabs
-tabA, tabB, tabCompare = st.tabs(["Scenario A", "Scenario B", "Comparison"])
+def scenario_inputs(col, name_default="Scenario"):
+    with col:
+        st.subheader(name_default)
+        name = st.text_input("Scenario name", value=name_default, key=f"name_{name_default}")
 
-with tabA:
-    st.subheader("Scenario A – Contract Terms")
-    col1, col2 = st.columns(2)
-    with col1:
-        list_price_A = st.number_input("List price A (€/unit)", value=178.0, step=1.0, key="lp_A")
-        discount_A = st.number_input("Discount A (%)", value=0.0, step=0.1, key="disc_A")
-        payment_terms_days_A = st.number_input("Payment terms A (days)", value=60, step=5, key="pt_A")
-    with col2:
-        initial_component_inventory_A = st.number_input(
-            "Initial OLED inventory A (units)", value=500, step=50, key="inv_comp_A"
+        st.markdown("**Sales Volume Agreement (monthly units)**")
+        default_units = [5800] * 12
+        df = pd.DataFrame({"Month": MONTHS, "Volume": default_units})
+        edited_df = st.data_editor(
+            df,
+            num_rows="fixed",
+            key=f"volume_{name_default}",
+            hide_index=True,
         )
-        initial_final_inventory_A = st.number_input(
-            "Initial final product inventory A (units)", value=500, step=50, key="inv_final_A"
+        monthly_volume = edited_df["Volume"].values
+
+        st.markdown("**Commercial terms**")
+        gross_price = st.number_input(
+            "Gross price (€/unit, before discount)",
+            value=179.0,
+            step=1.0,
+            key=f"gross_{name_default}",
         )
-        doa_replacement_mode_A = st.selectbox(
-            "DOA replacement timing A",
-            ["Next month", "Next delivery"],
-            key="doa_rep_A",
+        discount_pct = st.number_input(
+            "Discount (%)",
+            value=1.0,
+            step=0.5,
+            key=f"disc_{name_default}",
         )
-
-    st.markdown("**Monthly OLED supply plan A (from CDA)**")
-    monthly_supply_plan_A = []
-    cols = st.columns(4)
-    for i in range(12):
-        with cols[i % 4]:
-            monthly_supply_plan_A.append(
-                st.number_input(
-                    f"Sup A M{i + 1}",
-                    value=default_supply_plan()[i],
-                    step=50,
-                    key=f"sup_A_{i}",
-                )
-            )
-
-    st.markdown("**Monthly production plan A (final units)**")
-    monthly_production_plan_A = []
-    cols_prod_A = st.columns(4)
-    for i in range(12):
-        with cols_prod_A[i % 4]:
-            monthly_production_plan_A.append(
-                st.number_input(
-                    f"Prod A M{i + 1}",
-                    value=default_prod_plan()[i],
-                    step=50,
-                    key=f"prod_A_{i}",
-                )
-            )
-
-    st.markdown("**Service & ESG A**")
-    col1, col2 = st.columns(2)
-    with col1:
-        customization_A = st.checkbox("Customization included A", value=True, key="cust_A")
-        ecolowrap_A = st.checkbox("Ecolowrap A", value=True, key="eco_A")
-    with col2:
-        technical_support_weeks_A = st.number_input(
-            "Tech support A (engineer-weeks)", value=3.0, step=0.5, key="ts_A"
+        incoterm = st.selectbox(
+            "Incoterm",
+            options=["Ex Works", "CIP"],
+            key=f"incoterm_{name_default}",
+        )
+        terms_payment = st.number_input(
+            "Terms of payment (days)",
+            value=60,
+            min_value=0,
+            step=5,
+            key=f"terms_{name_default}",
         )
 
-with tabB:
-    st.subheader("Scenario B – Contract Terms")
-    col1, col2 = st.columns(2)
-    with col1:
-        list_price_B = st.number_input("List price B (€/unit)", value=178.0, step=1.0, key="lp_B")
-        discount_B = st.number_input("Discount B (%)", value=0.0, step=0.1, key="disc_B")
-        payment_terms_days_B = st.number_input("Payment terms B (days)", value=60, step=5, key="pt_B")
-    with col2:
-        initial_component_inventory_B = st.number_input(
-            "Initial OLED inventory B (units)", value=500, step=50, key="inv_comp_B"
+        st.markdown("**Operational terms**")
+        doa_replacement = st.selectbox(
+            "DOA replacement timing",
+            options=["Next Month", "Next Delivery"],
+            key=f"doa_{name_default}",
         )
-        initial_final_inventory_B = st.number_input(
-            "Initial final product inventory B (units)", value=500, step=50, key="inv_final_B"
+        tech_support = st.number_input(
+            "Technical support (engineer-weeks)",
+            value=3.0,
+            min_value=0.0,
+            step=1.0,
+            key=f"tech_{name_default}",
         )
-        doa_replacement_mode_B = st.selectbox(
-            "DOA replacement timing B",
-            ["Next month", "Next delivery"],
-            key="doa_rep_B",
+        customization = st.checkbox(
+            "Include customization?", value=True, key=f"cust_{name_default}"
         )
-
-    st.markdown("**Monthly OLED supply plan B (from CDA)**")
-    monthly_supply_plan_B = []
-    cols = st.columns(4)
-    for i in range(12):
-        with cols[i % 4]:
-            monthly_supply_plan_B.append(
-                st.number_input(
-                    f"Sup B M{i + 1}",
-                    value=default_supply_plan()[i],
-                    step=50,
-                    key=f"sup_B_{i}",
-                )
-            )
-
-    st.markdown("**Monthly production plan B (final units)**")
-    monthly_production_plan_B = []
-    cols_prod_B = st.columns(4)
-    for i in range(12):
-        with cols_prod_B[i % 4]:
-            monthly_production_plan_B.append(
-                st.number_input(
-                    f"Prod B M{i + 1}",
-                    value=default_prod_plan()[i],
-                    step=50,
-                    key=f"prod_B_{i}",
-                )
-            )
-
-    st.markdown("**Service & ESG B**")
-    col1, col2 = st.columns(2)
-    with col1:
-        customization_B = st.checkbox("Customization included B", value=True, key="cust_B")
-        ecolowrap_B = st.checkbox("Ecolowrap B", value=True, key="eco_B")
-    with col2:
-        technical_support_weeks_B = st.number_input(
-            "Tech support B (engineer-weeks)", value=3.0, step=0.5, key="ts_B"
+        ecolowrap = st.checkbox(
+            "Use Ecolowrap (eligible for grant)?",
+            value=True,
+            key=f"eco_{name_default}",
         )
 
-run = st.button("Run simulation for both scenarios")
+    return {
+        "name": name,
+        "monthly_volume": monthly_volume,
+        "gross_price": gross_price,
+        "discount_pct": discount_pct,
+        "incoterm": incoterm,
+        "terms_payment": terms_payment,
+        "doa_replacement": doa_replacement,
+        "tech_support": tech_support,
+        "customization": customization,
+        "ecolowrap": ecolowrap,
+    }
 
-if run:
-    df_A, kpis_A = simulate_contract(
-        list_price=list_price_A,
-        discount=discount_A,
-        monthly_oled_delivery_plan=monthly_supply_plan_A,
-        initial_component_inventory=initial_component_inventory_A,
-        monthly_production_plan=monthly_production_plan_A,
-        payment_terms_days=payment_terms_days_A,
-        doa_rate=doa_rate_global,
-        doa_replacement_mode=doa_replacement_mode_A,
-        customization=customization_A,
-        technical_support_weeks=technical_support_weeks_A,
-        ecolowrap=ecolowrap_A,
-        cost_of_capital=cost_of_capital_global,
-        transport_cost_per_unit_from_cda=transport_cost_per_unit_from_cda_global,
-        transport_cost_per_unit_to_cda=transport_cost_per_unit_to_cda_global,
-        insurance_cost_per_unit=insurance_cost_per_unit_global,
-        field_failure_rate=field_failure_rate_global,
-        final_product_price=final_product_price_global,
-        monthly_demand_units=monthly_demand_units_global,
-        prod_cost_per_unit_excl_oled=prod_cost_per_unit_excl_oled_global,
-        initial_final_inventory=initial_final_inventory_A,
-        neginfo_cost=neginfo_cost_global,
+inputs_A = scenario_inputs(colA, "Scenario A")
+inputs_B = scenario_inputs(colB, "Scenario B")
+
+# ---------- RUN SIMULATION ----------
+if st.button("Run simulation and compare"):
+    scenario_results = []
+    for inputs in [inputs_A, inputs_B]:
+        res = simulate_scenario(
+            name=inputs["name"],
+            monthly_volume=inputs["monthly_volume"],
+            gross_price=inputs["gross_price"],
+            discount_pct=inputs["discount_pct"],
+            terms_of_payment_days=inputs["terms_payment"],
+            use_ecolowrap=inputs["ecolowrap"],
+            tech_support_weeks=inputs["tech_support"],
+            customization=inputs["customization"],
+            incoterm=inputs["incoterm"],
+            doa_replacement=inputs["doa_replacement"],
+            expected_monthly_demand=expected_monthly_demand,
+            selling_price=selling_price,
+        )
+        scenario_results.append(res)
+
+    df_results = pd.DataFrame(scenario_results)
+
+    st.subheader("Key results comparison")
+    metrics_to_show = [
+        "Profit (M€)",
+        "Units sold (estimated)",
+        "Revenue (M€)",
+        "OLED cost (M€)",
+        "Other variable cost (M€)",
+        "Fixed cost (M€)",
+        "Warranty cost (M€)",
+        "Inventory cost (M€)",
+        "Financing benefit (M€)",
+        "Tech support benefit (M€)",
+        "Customization benefit (M€)",
+        "Ecolowrap benefit (M€)",
+        "Margin per unit (€/unit)",
+        "Terms of payment (days)",
+    ]
+
+    st.dataframe(
+        df_results[["Scenario"] + metrics_to_show].set_index("Scenario"),
+        use_container_width=True,
     )
 
-    df_B, kpis_B = simulate_contract(
-        list_price=list_price_B,
-        discount=discount_B,
-        monthly_oled_delivery_plan=monthly_supply_plan_B,
-        initial_component_inventory=initial_component_inventory_B,
-        monthly_production_plan=monthly_production_plan_B,
-        payment_terms_days=payment_terms_days_B,
-        doa_rate=doa_rate_global,
-        doa_replacement_mode=doa_replacement_mode_B,
-        customization=customization_B,
-        technical_support_weeks=technical_support_weeks_B,
-        ecolowrap=ecolowrap_B,
-        cost_of_capital=cost_of_capital_global,
-        transport_cost_per_unit_from_cda=transport_cost_per_unit_from_cda_global,
-        transport_cost_per_unit_to_cda=transport_cost_per_unit_to_cda_global,
-        insurance_cost_per_unit=insurance_cost_per_unit_global,
-        field_failure_rate=field_failure_rate_global,
-        final_product_price=final_product_price_global,
-        monthly_demand_units=monthly_demand_units_global,
-        prod_cost_per_unit_excl_oled=prod_cost_per_unit_excl_oled_global,
-        initial_final_inventory=initial_final_inventory_B,
-        neginfo_cost=neginfo_cost_global,
+    # Simple highlight of which scenario wins on profit
+    best_idx = df_results["Profit (M€)"].idxmax()
+    best_scenario = df_results.loc[best_idx, "Scenario"]
+    st.success(f"Scenario with higher estimated profit for IPB: **{best_scenario}**")
+
+    st.caption(
+        "Note: This is an approximation based on the case data. "
+        "Technical support, customization and DOA timing are valued using the assumptions in the sidebar; "
+        "you can adjust those to match your own view or the professor’s scoring logic."
     )
-
-    # Show details inside each scenario tab
-    with tabA:
-        st.markdown("---")
-        st.subheader("Scenario A – Monthly results")
-        st.dataframe(df_A)
-        st.subheader("Scenario A – Component inventory over time")
-        st.line_chart(df_A.set_index("Month")["Component inventory end"])
-        st.subheader("Scenario A – Key KPIs")
-        st.json(kpis_A)
-
-    with tabB:
-        st.markdown("---")
-        st.subheader("Scenario B – Monthly results")
-        st.dataframe(df_B)
-        st.subheader("Scenario B – Component inventory over time")
-        st.line_chart(df_B.set_index("Month")["Component inventory end"])
-        st.subheader("Scenario B – Key KPIs")
-        st.json(kpis_B)
-
-    # Comparison tab
-    with tabCompare:
-        st.subheader("KPI comparison – Scenario A vs Scenario B")
-        compare_keys = [
-            "Component final price (€/unit)",
-            "Total OLEDs purchased",
-            "Total units produced",
-            "Total units sold",
-            "Component purchase cost (€/year)",
-            "Production cost excl. OLEDs (€/year)",
-            "Transport from CDA (€/year)",
-            "Insurance cost (€/year)",
-            "Inventory capital cost (€/year)",
-            "Ecolowrap subsidy (€/year)",
-            "NEGINFO cost (€/year)",
-            "Total sales revenue (€/year)",
-            "Profit from negotiation (€/year)",
-        ]
-
-        rows = []
-        for key in compare_keys:
-            val_A = kpis_A.get(key, None)
-            val_B = kpis_B.get(key, None)
-            diff = None
-            if isinstance(val_A, (int, float)) and isinstance(val_B, (int, float)):
-                diff = val_B - val_A
-            rows.append({"KPI": key, "Scenario A": val_A, "Scenario B": val_B, "B - A": diff})
-
-        comp_df = pd.DataFrame(rows)
-        st.dataframe(comp_df)
-
-        st.markdown("---")
-        st.subheader("Profit comparison")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(
-                "Profit A (€/year)",
-                f"{kpis_A['Profit from negotiation (€/year)']:,}".replace(",", " "),
-            )
-        with col2:
-            st.metric(
-                "Profit B (€/year)",
-                f"{kpis_B['Profit from negotiation (€/year)']:,}".replace(",", " "),
-            )
-        with col3:
-            delta_profit = kpis_B["Profit from negotiation (€/year)"] - kpis_A[
-                "Profit from negotiation (€/year)"
-            ]
-            st.metric("B - A (€/year)", f"{delta_profit:,}".replace(",", " "))
-
-st.markdown(
-    """
----
-### How to use this app
-1. Set the *global game parameters* in the sidebar (DOA rate, demand, production cost, etc.).  \
-2. In **Scenario A** and **Scenario B** tabs, enter contract terms, **monthly OLED supply plans** and production plans.  \
-3. Click **Run simulation for both scenarios**.  \
-4. Review each scenario in its tab, then open **Comparison** to see KPI and profit deltas.  \
-5. Save this script as `negotiation_sim_app.py`, push it to GitHub, and run with:
-
-```bash
-streamlit run negotiation_sim_app.py
-```
-"""
-)
